@@ -1,218 +1,116 @@
 /**
  * Tournament WebSocket Server
- * Windows-safe, Redis-v4-stable, env-driven
+ * Railway + Upstash Redis (Production Ready)
  *
- * Usage:
- *   node websocket-server.js
+ * Required ENV:
+ *   PORT        -> provided automatically by Railway
+ *   REDIS_URL   -> Upstash Redis URL (rediss://...)
  */
 
-require('dotenv').config({
-    path: require('fs').existsSync('.env.local') ? '.env.local' : '.env'
-});
+require('dotenv').config();
 
 const WebSocket = require('ws');
 const http = require('http');
-const fs = require('fs');
-const path = require('path');
+const { createClient } = require('redis');
 
 /* ================= CONFIG ================= */
 
-const PORT = Number(process.env.WEBSOCKET_PORT) || 8081;
+const PORT = process.env.PORT; // REQUIRED by Railway
+const REDIS_URL = process.env.REDIS_URL;
 
-const REDIS_HOST = process.env.REDIS_HOST || '127.0.0.1';
-const REDIS_PORT = process.env.REDIS_PORT
-    ? Number(process.env.REDIS_PORT)
-    : 6379;
+if (!PORT) {
+  console.error('❌ PORT not defined');
+  process.exit(1);
+}
 
-const REDIS_ENABLED = Boolean(REDIS_HOST && REDIS_PORT);
-
-const EVENT_DIR = path.resolve(
-    __dirname,
-    process.env.WEBSOCKET_EVENTS_DIR || 'var/websocket_events'
-);
-
-const REDIS_RETRY_INTERVAL = 5000;
+if (!REDIS_URL) {
+  console.error('❌ REDIS_URL not defined');
+  process.exit(1);
+}
 
 /* ================= WEBSOCKET ================= */
 
 const server = http.createServer();
+
 const wss = new WebSocket.Server({
-    server,
-    path: '/ws/tournaments',
-    verifyClient: () => true
+  server,
+  path: '/ws/tournaments'
 });
 
 const clients = new Set();
 
 wss.on('connection', ws => {
-    clients.add(ws);
-    console.log(`✅ Client connected (${clients.size})`);
+  clients.add(ws);
+  console.log(`✅ Client connected (${clients.size})`);
 
-    ws.send(JSON.stringify({
-        event: 'connected',
-        payload: { message: 'Connected to tournament WebSocket server' }
-    }));
+  ws.send(JSON.stringify({
+    event: 'connected',
+    payload: { message: 'Connected to tournament WebSocket server' }
+  }));
 
-    ws.on('close', () => {
-        clients.delete(ws);
-        console.log(`❌ Client disconnected (${clients.size})`);
-    });
+  ws.on('close', () => {
+    clients.delete(ws);
+    console.log(`❌ Client disconnected (${clients.size})`);
+  });
 
-    ws.on('error', () => {
-        clients.delete(ws);
-    });
+  ws.on('error', () => {
+    clients.delete(ws);
+  });
 });
 
 function broadcast(event) {
-    const message = JSON.stringify(event);
-    let sent = 0;
-    let failed = 0;
+  const message = JSON.stringify(event);
 
-    console.log(`\n📢 ===== BROADCASTING TO CLIENTS =====`);
-    console.log(`Event: ${event.event}`);
-    console.log(`Total clients: ${clients.size}`);
-    console.log(`Message preview: ${message.substring(0, 150)}...`);
-
-    for (const client of clients) {
-        if (client.readyState === WebSocket.OPEN) {
-            try {
-                client.send(message);
-                sent++;
-            } catch (err) {
-                console.error(`❌ Failed to send to client:`, err.message);
-                failed++;
-            }
-        } else {
-            console.log(`⚠️  Client not ready (state: ${client.readyState})`);
-            failed++;
-        }
+  for (const client of clients) {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(message);
     }
-
-    console.log(`📤 Broadcast complete: ${sent} sent, ${failed} failed (${clients.size} total)`);
-    console.log(`===== BROADCAST END =====\n`);
+  }
 }
 
-/* ================= REDIS (v4 FIXED) ================= */
+/* ================= REDIS (UPSTASH) ================= */
 
-let redisAvailable = false;
-let redisClient = null;
-let redisSubscriber = null;
+(async () => {
+  try {
+    const redisClient = createClient({
+      url: REDIS_URL
+    });
 
-async function startRedis() {
-    if (!REDIS_ENABLED) {
-        console.log('ℹ Redis disabled');
-        return;
-    }
+    const redisSubscriber = redisClient.duplicate();
 
-    try {
-        const Redis = require('redis');
+    redisClient.on('error', err => {
+      console.error('❌ Redis client error:', err.message);
+    });
 
-        redisClient = Redis.createClient({
-            socket: {
-                host: REDIS_HOST,
-                port: REDIS_PORT,
-                reconnectStrategy: retries =>
-                    Math.min(retries * REDIS_RETRY_INTERVAL, 30000)
-            }
-        });
+    redisSubscriber.on('error', err => {
+      console.error('❌ Redis subscriber error:', err.message);
+    });
 
-        redisSubscriber = redisClient.duplicate();
+    await redisClient.connect();
+    await redisSubscriber.connect();
 
-        redisClient.on('error', err => {
-            console.error('❌ Redis client error:', err.message);
-            redisAvailable = false;
-        });
+    console.log('✅ Redis connected');
 
-        redisSubscriber.on('error', err => {
-            console.error('❌ Redis subscriber error:', err.message);
-            redisAvailable = false;
-        });
+    await redisSubscriber.subscribe('tournament_events', message => {
+      try {
+        const event = JSON.parse(message);
+        console.log(`📥 Redis event: ${event.event}`);
+        broadcast(event);
+      } catch (err) {
+        console.error('❌ Invalid Redis message:', err.message);
+      }
+    });
 
-        await redisClient.connect();
-        await redisSubscriber.connect();
+    console.log('✅ Subscribed to tournament_events');
+  } catch (err) {
+    console.error('❌ Redis connection failed:', err.message);
+    process.exit(1);
+  }
+})();
 
-        redisAvailable = true;
-        console.log('✅ Redis connected');
+/* ================= START SERVER ================= */
 
-        // 🔥 REDIS v4 CORRECT SUBSCRIBE
-        await redisSubscriber.subscribe('tournament_events', (message) => {
-            try {
-                console.log('\n📥 ===== REDIS MESSAGE RECEIVED =====');
-                console.log('Raw:', message);
-
-                const event = JSON.parse(message);
-
-                console.log('Event:', event.event);
-                console.log('Payload keys:', Object.keys(event.payload || {}));
-
-                broadcast(event);
-
-                console.log('✅ ===== MESSAGE PROCESSED =====\n');
-            } catch (err) {
-                console.error('❌ Redis message parse error:', err.message);
-                console.error('Raw:', message);
-            }
-        });
-
-        console.log('✅ Subscribed to tournament_events');
-    } catch (err) {
-        redisAvailable = false;
-        console.warn('⚠ Redis unavailable, using file fallback');
-        console.warn(err.message);
-    }
-}
-
-startRedis();
-
-/* ================= FILE FALLBACK ================= */
-
-if (!fs.existsSync(EVENT_DIR)) {
-    fs.mkdirSync(EVENT_DIR, { recursive: true });
-}
-
-console.log('📁 Watching event directory:', EVENT_DIR);
-
-const processedFiles = new Set();
-
-setInterval(() => {
-    if (redisAvailable) return;
-
-    try {
-        const files = fs.readdirSync(EVENT_DIR)
-            .filter(f => f.startsWith('tournament_') && f.endsWith('.json'));
-
-        for (const file of files) {
-            if (processedFiles.has(file)) continue;
-
-            const filePath = path.join(EVENT_DIR, file);
-            processedFiles.add(file);
-
-            try {
-                const stats = fs.statSync(filePath);
-                if (Date.now() - stats.mtimeMs < 50) {
-                    processedFiles.delete(file);
-                    continue;
-                }
-
-                const raw = fs.readFileSync(filePath, 'utf8');
-                const event = JSON.parse(raw);
-
-                console.log('📂 File event:', event.event);
-                broadcast(event);
-
-                fs.unlinkSync(filePath);
-            } catch (err) {
-                console.error('❌ File event error:', err.message);
-            }
-        }
-    } catch (err) {
-        console.error('❌ Directory watch error:', err.message);
-    }
-}, 500);
-
-/* ================= START ================= */
-
-server.listen(PORT, () => {
-    console.log('🚀 Tournament WebSocket server running');
-    console.log(`🔗 ws://localhost:${PORT}/ws/tournaments`);
+server.listen(PORT, '0.0.0.0', () => {
+  console.log('🚀 Tournament WebSocket server running');
+  console.log(`🔗 Listening on port ${PORT}`);
 });
