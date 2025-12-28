@@ -1,7 +1,14 @@
 {
+  "name": "b2battle-websocket",
+  "version": "1.0.0",
+  "main": "websocket-server.js",
+  "scripts": {
+    "start": "node websocket-server.js"
+  },
   "dependencies": {
-    "dotenv": "^17.2.3",
-    "redis": "^4.6.10",
-    "ws": "^8.18.3"
+    "ws": "^8.18.0",
+    "redis": "^4.6.13",
+    "dotenv": "^17.2.3"
   }
 }
+
